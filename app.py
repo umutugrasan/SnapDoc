@@ -15,6 +15,23 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
+# --- streamlit-drawable-canvas uyum yaması ---------------------------------
+# Streamlit 1.30+ `image_to_url` fonksiyonunu streamlit.elements.image'ten
+# streamlit.elements.lib.image_utils'a taşıdı; streamlit-drawable-canvas
+# 0.9.x hâlâ eski yoldan import ettiği için AttributeError veriyor.
+# Eksikse yeni konumdan alıp eski isim altına bağlıyoruz.
+try:
+    import streamlit.elements.image as _st_image
+    if not hasattr(_st_image, "image_to_url"):
+        try:
+            from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
+        except ImportError:
+            from streamlit.runtime.media_file_manager import _image_to_url  # type: ignore
+        _st_image.image_to_url = _image_to_url
+except Exception:
+    pass
+# ---------------------------------------------------------------------------
+
 from modules.detector import (
     detect_document_corners,
     draw_corners,
