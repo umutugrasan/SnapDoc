@@ -16,18 +16,54 @@ import streamlit as st
 from PIL import Image
 
 # --- streamlit-drawable-canvas uyum yaması ---------------------------------
-# Streamlit 1.30+ `image_to_url` fonksiyonunu streamlit.elements.image'ten
-# streamlit.elements.lib.image_utils'a taşıdı; streamlit-drawable-canvas
-# 0.9.x hâlâ eski yoldan import ettiği için AttributeError veriyor.
-# Eksikse yeni konumdan alıp eski isim altına bağlıyoruz.
-try:
+# Streamlit, image_to_url'ı streamlit.elements.image'ten
+# streamlit.elements.lib.image_utils'a taşıdı VE imzasını değiştirdi
+# (eski: (image, width:int, clamp, channels, output_format, image_id)).
+# streamlit-drawable-canvas 0.9.x hâlâ eski imzayla çağırıyor.
+# Bu yama, eski isim altına imzayı çeviren bir adapter bağlar.
+def _install_canvas_compat() -> None:
     import streamlit.elements.image as _st_image
-    if not hasattr(_st_image, "image_to_url"):
-        try:
-            from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
-        except ImportError:
-            from streamlit.runtime.media_file_manager import _image_to_url  # type: ignore
-        _st_image.image_to_url = _image_to_url
+    if hasattr(_st_image, "image_to_url"):
+        return
+    try:
+        from streamlit.elements.lib import image_utils as _img_utils
+    except ImportError:
+        return
+
+    _new_fn = getattr(_img_utils, "image_to_url", None)
+    if _new_fn is None:
+        return
+
+    def _build_layout_config(width):
+        """`.width` özniteliğine sahip, kütüphanenin yeni imzasına uygun obje."""
+        WidthClass = getattr(_img_utils, "WidthBehavior", None)
+        if WidthClass is not None:
+            # Dataclass / NamedTuple varyantlarını dene
+            for ctor in (lambda: WidthClass(width=width), lambda: WidthClass(width)):
+                try:
+                    return ctor()
+                except TypeError:
+                    continue
+        from types import SimpleNamespace
+        return SimpleNamespace(width=width, use_container_width=False)
+
+    import inspect
+    _params = list(inspect.signature(_new_fn).parameters.keys())
+
+    def _adapter(image, width, clamp=False, channels="RGB",
+                 output_format="auto", image_id=""):
+        layout = _build_layout_config(width)
+        # Yeni daraltılmış imza: (image_data, layout_config, image_format)
+        if len(_params) <= 3:
+            return _new_fn(image, layout, output_format)
+        # Geçiş dönemi imzası: tüm eski parametreleri de kabul ediyor
+        return _new_fn(image, layout, clamp, channels, output_format, image_id)
+
+    _st_image.image_to_url = _adapter
+
+
+try:
+    _install_canvas_compat()
 except Exception:
     pass
 # ---------------------------------------------------------------------------
@@ -66,6 +102,73 @@ def _bgr_to_pil(image: np.ndarray) -> Image.Image:
 @st.cache_resource(show_spinner="OCR modeli yükleniyor (ilk seferde yavaş)…")
 def get_ocr_engine(languages: tuple[str, ...]) -> OCREngine:
     return OCREngine(languages=list(languages), gpu=False)
+
+
+def _numeric_corner_inputs(image_bgr: np.ndarray, idx: int) -> np.ndarray:
+    """Canvas yedek planı: 4 köşeyi sayı inputlarıyla al."""
+    h, w = image_bgr.shape[:2]
+    st.caption("Köşe koordinatlarını piksel olarak gir (0,0 = sol-üst).")
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("**Sol-Üst (TL)**")
+        tl_x = st.number_input("TL x", 0, w - 1, 0, key=f"tlx_{idx}")
+        tl_y = st.number_input("TL y", 0, h - 1, 0, key=f"tly_{idx}")
+        st.markdown("**Sol-Alt (BL)**")
+        bl_x = st.number_input("BL x", 0, w - 1, 0, key=f"blx_{idx}")
+        bl_y = st.number_input("BL y", 0, h - 1, h - 1, key=f"bly_{idx}")
+    with cB:
+        st.markdown("**Sağ-Üst (TR)**")
+        tr_x = st.number_input("TR x", 0, w - 1, w - 1, key=f"trx_{idx}")
+        tr_y = st.number_input("TR y", 0, h - 1, 0, key=f"try_{idx}")
+        st.markdown("**Sağ-Alt (BR)**")
+        br_x = st.number_input("BR x", 0, w - 1, w - 1, key=f"brx_{idx}")
+        br_y = st.number_input("BR y", 0, h - 1, h - 1, key=f"bry_{idx}")
+    return np.array(
+        [[tl_x, tl_y], [tr_x, tr_y], [br_x, br_y], [bl_x, bl_y]],
+        dtype="float32",
+    )
+
+
+def _manual_corner_ui(image_bgr: np.ndarray, idx: int) -> np.ndarray | None:
+    """Tıklanabilir canvas; başarısızsa sayı inputlu yedek."""
+    try:
+        from streamlit_drawable_canvas import st_canvas
+    except ImportError:
+        st.info(
+            "streamlit-drawable-canvas yok; köşeleri sayıyla girerek devam ediyoruz."
+        )
+        return _numeric_corner_inputs(image_bgr, idx)
+
+    try:
+        st.caption("Belgenin 4 köşesini sırayla tıkla (TL → TR → BR → BL).")
+        disp = _bgr_to_pil(image_bgr)
+        max_w = 700
+        scale = min(1.0, max_w / disp.width)
+        disp_w, disp_h = int(disp.width * scale), int(disp.height * scale)
+        canvas_res = st_canvas(
+            fill_color="rgba(0, 255, 0, 0.2)",
+            stroke_width=4, stroke_color="#00FF00",
+            background_image=disp.resize((disp_w, disp_h)),
+            update_streamlit=True,
+            height=disp_h, width=disp_w,
+            drawing_mode="point", point_display_radius=6,
+            key=f"canvas_{idx}",
+        )
+    except Exception as e:
+        st.warning(
+            f"Kanvas yüklenemedi ({type(e).__name__}). "
+            "Köşeleri sayıyla girmeye geçiyoruz."
+        )
+        return _numeric_corner_inputs(image_bgr, idx)
+
+    if canvas_res is None or canvas_res.json_data is None:
+        return None
+    objs = canvas_res.json_data.get("objects", [])
+    pts = [(o["left"], o["top"]) for o in objs if o.get("type") == "circle"]
+    if len(pts) < 4:
+        st.caption(f"({len(pts)}/4 köşe işaretlendi)")
+        return None
+    return np.array(pts[:4], dtype="float32") / scale
 
 
 def process_one(
@@ -140,34 +243,7 @@ for idx, f in enumerate(files, start=1):
 
     manual_corners = None
     if manual_toggle:
-        try:
-            from streamlit_drawable_canvas import st_canvas
-        except ImportError:
-            st.warning(
-                "Manuel düzeltme için `pip install streamlit-drawable-canvas`. "
-                "Otomatik tespite geri dönülüyor."
-            )
-        else:
-            st.caption("Belgenin 4 köşesini sırayla tıkla (TL → TR → BR → BL).")
-            disp = _bgr_to_pil(image_bgr)
-            max_w = 700
-            scale = min(1.0, max_w / disp.width)
-            disp_w, disp_h = int(disp.width * scale), int(disp.height * scale)
-            canvas_res = st_canvas(
-                fill_color="rgba(0, 255, 0, 0.2)",
-                stroke_width=4, stroke_color="#00FF00",
-                background_image=disp.resize((disp_w, disp_h)),
-                update_streamlit=True,
-                height=disp_h, width=disp_w,
-                drawing_mode="point", point_display_radius=6,
-                key=f"canvas_{idx}",
-            )
-            if canvas_res.json_data is not None:
-                objs = canvas_res.json_data.get("objects", [])
-                pts = [(o["left"], o["top"]) for o in objs if o.get("type") == "circle"]
-                if len(pts) >= 4:
-                    arr = np.array(pts[:4], dtype="float32") / scale
-                    manual_corners = arr
+        manual_corners = _manual_corner_ui(image_bgr, idx)
 
     preview, warped, enhanced = process_one(
         image_bgr, mode=mode, manual_corners=manual_corners,
